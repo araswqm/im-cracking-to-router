@@ -15,6 +15,8 @@ Endpoints:
     GET /api              — All vehicles, all data
     GET /api?vin=XXXXX    — Single vehicle by VIN
     GET /api/health       — Health check (no BYD auth)
+    GET /api/widget       — Compact widget data (battery, range, temps, status)
+    GET /api/widget?vin=XXXXX — Widget data for specific vehicle
 """
 
 from __future__ import annotations
@@ -176,6 +178,152 @@ async def get_vehicle_data(
             "vehicle_count": len(vehicle_results),
             "vehicles": vehicle_results,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+@app.get("/api/widget")
+async def get_widget_data(
+    request: Request,
+    vin: str | None = Query(
+        default=None,
+        description="Filter by a specific vehicle VIN. Omit to use first vehicle.",
+    ),
+) -> dict:
+    """Fetch compact widget data for dashboard display.
+
+    Returns battery %, range, tire pressures, lock status, charging status,
+    climate status, online status, and last update timestamp.
+    """
+    config = _build_config()
+
+    # ── Authenticate & discover vehicles ──────────────────────────────
+    async with BydClient(config) as client:
+        try:
+            await client.login()
+        except BydAuthenticationError as exc:
+            raise HTTPException(
+                status_code=401,
+                detail=f"BYD authentication failed. Check your credentials. ({exc})",
+            ) from exc
+        except BydTransportError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Could not reach BYD servers. ({exc})",
+            ) from exc
+        except BydApiError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"BYD API error during login. ({exc})",
+            ) from exc
+
+        # Fetch vehicle list
+        try:
+            vehicles = await client.get_vehicles()
+        except (BydApiError, BydTransportError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to fetch vehicle list. ({exc})",
+            ) from exc
+
+        if not vehicles:
+            raise HTTPException(
+                status_code=404,
+                detail="No vehicles found on this BYD account.",
+            )
+
+        # Filter or use first vehicle
+        if vin:
+            vehicles = [v for v in vehicles if v.vin == vin]
+            if not vehicles:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No vehicle found with VIN: {vin}",
+                )
+
+        target_vehicle = vehicles[0]
+
+        # Fetch realtime and charging data in parallel
+        try:
+            realtime_data = await client.get_vehicle_realtime(target_vehicle.vin)
+            charging_data, _ = await client.get_charging_homepage(target_vehicle.vin)
+        except BydDataUnavailableError:
+            raise HTTPException(
+                status_code=404,
+                detail="Vehicle data temporarily unavailable.",
+            ) from None
+        except (BydApiError, BydTransportError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to fetch vehicle data. ({exc})",
+            ) from exc
+
+        # Extract widget data
+        # Try to extract battery percentage
+        battery = 0
+        if hasattr(realtime_data, "battery_level"):
+            battery = int(realtime_data.battery_level) if realtime_data.battery_level else 0
+        elif hasattr(realtime_data, "soc"):
+            battery = int(realtime_data.soc) if realtime_data.soc else 0
+
+        # Try to extract ranges
+        range_val = 0
+        ev_range_val = 0
+        if hasattr(realtime_data, "range"):
+            range_val = int(realtime_data.range) if realtime_data.range else 0
+        if hasattr(realtime_data, "ev_range"):
+            ev_range_val = int(realtime_data.ev_range) if realtime_data.ev_range else 0
+
+        # Try to extract tire pressures
+        lf = 0.0
+        rf = 0.0
+        lr = 0.0
+        rr = 0.0
+        if hasattr(realtime_data, "tire_pressure_lf"):
+            lf = float(realtime_data.tire_pressure_lf) if realtime_data.tire_pressure_lf else 0.0
+        if hasattr(realtime_data, "tire_pressure_rf"):
+            rf = float(realtime_data.tire_pressure_rf) if realtime_data.tire_pressure_rf else 0.0
+        if hasattr(realtime_data, "tire_pressure_lr"):
+            lr = float(realtime_data.tire_pressure_lr) if realtime_data.tire_pressure_lr else 0.0
+        if hasattr(realtime_data, "tire_pressure_rr"):
+            rr = float(realtime_data.tire_pressure_rr) if realtime_data.tire_pressure_rr else 0.0
+
+        # Try to extract lock status
+        locked = True
+        if hasattr(realtime_data, "is_locked"):
+            locked = bool(realtime_data.is_locked)
+
+        # Try to extract charging status
+        charging = False
+        if hasattr(charging_data, "is_charging"):
+            charging = bool(charging_data.is_charging)
+
+        # Try to extract climate status
+        climate = False
+        if hasattr(realtime_data, "is_climate_on"):
+            climate = bool(realtime_data.is_climate_on)
+
+        # Try to extract online status
+        online = True
+        if hasattr(realtime_data, "is_online"):
+            online = bool(realtime_data.is_online)
+
+        # Format current time
+        now = datetime.now()
+        updated = now.strftime("%H:%M")
+
+        return {
+            "battery": battery,
+            "range": range_val,
+            "evRange": ev_range_val,
+            "locked": locked,
+            "charging": charging,
+            "climate": climate,
+            "online": online,
+            "lf": lf,
+            "rf": rf,
+            "lr": lr,
+            "rr": rr,
+            "updated": updated,
         }
 
 
