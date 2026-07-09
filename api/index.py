@@ -269,11 +269,11 @@ async def get_widget_data(
         range_val = int(raw_data.get("enduranceMileage", 0)) if raw_data.get("enduranceMileage") else 0
         ev_range_val = int(raw_data.get("evEndurance", 0)) if raw_data.get("evEndurance") else 0
         
-        # Tire pressures
-        lf = float(raw_data.get("leftFrontTirePressure", 0)) if raw_data.get("leftFrontTirePressure") else 0.0
-        rf = float(raw_data.get("rightFrontTirePressure", 0)) if raw_data.get("rightFrontTirePressure") else 0.0
-        lr = float(raw_data.get("leftRearTirePressure", 0)) if raw_data.get("leftRearTirePressure") else 0.0
-        rr = float(raw_data.get("rightRearTirePressure", 0)) if raw_data.get("rightRearTirePressure") else 0.0
+        # Tire pressures — note: lowercase 'p' in raw data
+        lf = float(raw_data.get("leftFrontTirepressure", 0)) if raw_data.get("leftFrontTirepressure") else 0.0
+        rf = float(raw_data.get("rightFrontTirepressure", 0)) if raw_data.get("rightFrontTirepressure") else 0.0
+        lr = float(raw_data.get("leftRearTirepressure", 0)) if raw_data.get("leftRearTirepressure") else 0.0
+        rr = float(raw_data.get("rightRearTirepressure", 0)) if raw_data.get("rightRearTirepressure") else 0.0
 
         # Lock status — leftFrontDoorLock == 2 means locked
         locked = raw_data.get("leftFrontDoorLock", 0) == 2
@@ -282,9 +282,9 @@ async def get_widget_data(
         charging_state = raw_data.get("chargingState", -1)
         charging = charging_state == 1
 
-        # Climate status — airRunState values: 0=off, 1=on, 2=preparing
+        # Climate status — airRunState only true when == 1 (actively running)
         air_run_state = raw_data.get("airRunState", 0)
-        climate = air_run_state > 0
+        climate = air_run_state == 1
 
         # Online status — onlineState == 1 means online
         online_state = raw_data.get("onlineState", 0)
