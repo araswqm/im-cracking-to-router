@@ -1,0 +1,12 @@
+# BYD Vehicle API — Vercel Serverless Function
+# Core: pyBYD library for BYD vehicle data access
+git+https://github.com/jkaberg/pyBYD.git
+
+# ASGI web framework
+fastapi>=0.100,<1
+
+# ASGI server (used by Vercel Python runtime)
+uvicorn>=0.24,<1
+
+# Optional: better HTTP handling on Vercel
+httpx>=0.25,<1
