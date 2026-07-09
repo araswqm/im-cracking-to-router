@@ -1,6 +1,6 @@
 # BYD Vehicle API — Vercel Serverless Function
 # Core: pyBYD library for BYD vehicle data access
-git+https://github.com/jkaberg/pyBYD.git
+pyBYD @ git+https://github.com/jkaberg/pyBYD.git
 
 # ASGI web framework
 fastapi>=0.100,<1
