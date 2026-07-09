@@ -257,55 +257,38 @@ async def get_widget_data(
                 detail=f"Failed to fetch vehicle data. ({exc})",
             ) from exc
 
-        # Extract widget data
-        # Try to extract battery percentage
-        battery = 0
-        if hasattr(realtime_data, "battery_level"):
-            battery = int(realtime_data.battery_level) if realtime_data.battery_level else 0
-        elif hasattr(realtime_data, "soc"):
-            battery = int(realtime_data.soc) if realtime_data.soc else 0
+        # Extract raw dict from realtime data model
+        raw_data = {}
+        if hasattr(realtime_data, "raw") and isinstance(realtime_data.raw, dict):
+            raw_data = realtime_data.raw
+        elif hasattr(realtime_data, "model_dump"):
+            raw_data = realtime_data.model_dump()
 
-        # Try to extract ranges
-        range_val = 0
-        ev_range_val = 0
-        if hasattr(realtime_data, "range"):
-            range_val = int(realtime_data.range) if realtime_data.range else 0
-        if hasattr(realtime_data, "ev_range"):
-            ev_range_val = int(realtime_data.ev_range) if realtime_data.ev_range else 0
+        # Extract widget data from raw dict with proper key names
+        battery = int(raw_data.get("elecPercent", 0)) if raw_data.get("elecPercent") else 0
+        range_val = int(raw_data.get("enduranceMileage", 0)) if raw_data.get("enduranceMileage") else 0
+        ev_range_val = int(raw_data.get("evEndurance", 0)) if raw_data.get("evEndurance") else 0
+        
+        # Tire pressures
+        lf = float(raw_data.get("leftFrontTirePressure", 0)) if raw_data.get("leftFrontTirePressure") else 0.0
+        rf = float(raw_data.get("rightFrontTirePressure", 0)) if raw_data.get("rightFrontTirePressure") else 0.0
+        lr = float(raw_data.get("leftRearTirePressure", 0)) if raw_data.get("leftRearTirePressure") else 0.0
+        rr = float(raw_data.get("rightRearTirePressure", 0)) if raw_data.get("rightRearTirePressure") else 0.0
 
-        # Try to extract tire pressures
-        lf = 0.0
-        rf = 0.0
-        lr = 0.0
-        rr = 0.0
-        if hasattr(realtime_data, "tire_pressure_lf"):
-            lf = float(realtime_data.tire_pressure_lf) if realtime_data.tire_pressure_lf else 0.0
-        if hasattr(realtime_data, "tire_pressure_rf"):
-            rf = float(realtime_data.tire_pressure_rf) if realtime_data.tire_pressure_rf else 0.0
-        if hasattr(realtime_data, "tire_pressure_lr"):
-            lr = float(realtime_data.tire_pressure_lr) if realtime_data.tire_pressure_lr else 0.0
-        if hasattr(realtime_data, "tire_pressure_rr"):
-            rr = float(realtime_data.tire_pressure_rr) if realtime_data.tire_pressure_rr else 0.0
+        # Lock status — leftFrontDoorLock == 2 means locked
+        locked = raw_data.get("leftFrontDoorLock", 0) == 2
 
-        # Try to extract lock status
-        locked = True
-        if hasattr(realtime_data, "is_locked"):
-            locked = bool(realtime_data.is_locked)
+        # Charging status — chargingState == 1 means charging
+        charging_state = raw_data.get("chargingState", -1)
+        charging = charging_state == 1
 
-        # Try to extract charging status
-        charging = False
-        if hasattr(charging_data, "is_charging"):
-            charging = bool(charging_data.is_charging)
+        # Climate status — airRunState values: 0=off, 1=on, 2=preparing
+        air_run_state = raw_data.get("airRunState", 0)
+        climate = air_run_state > 0
 
-        # Try to extract climate status
-        climate = False
-        if hasattr(realtime_data, "is_climate_on"):
-            climate = bool(realtime_data.is_climate_on)
-
-        # Try to extract online status
-        online = True
-        if hasattr(realtime_data, "is_online"):
-            online = bool(realtime_data.is_online)
+        # Online status — onlineState == 1 means online
+        online_state = raw_data.get("onlineState", 0)
+        online = online_state == 1
 
         # Format current time
         now = datetime.now()
