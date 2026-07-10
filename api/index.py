@@ -232,8 +232,32 @@ async def _fetch_vehicle_data(client: BydClient, vin: str) -> dict[str, object]:
         except Exception as exc:
             return key, None, f"Unexpected error: {exc}"
 
-    # Launch all 6 endpoints concurrently
-    tasks = [_safe_fetch(key) for key in _FETCH_ENDPOINTS]
+    async def _safe_fetch_gps() -> tuple[str, object | None, str | None]:
+        """Fetch GPS with more aggressive polling.
+
+        GPS uses a trigger-and-poll mechanism that can take longer
+        than the default 15 s (10 x 1.5 s).  This gives it more time
+        and returns a structured response when coordinates aren't
+        available instead of silently ``None``.
+        """
+        try:
+            result = await client.get_gps_info(
+                vin,
+                poll_attempts=30,
+                poll_interval=2.0,
+                mqtt_timeout=10.0,
+            )
+            return "gps", result, None
+        except BydDataUnavailableError:
+            return "gps", None, "No GPS fix (vehicle may be in a garage or underground)"
+        except (BydApiError, BydTransportError) as exc:
+            return "gps", None, str(exc)
+        except Exception as exc:
+            return "gps", None, f"Unexpected error: {exc}"
+
+    # Launch all 6 endpoints concurrently -- GPS uses its own call
+    tasks = [_safe_fetch(key) for key in _FETCH_ENDPOINTS if key != "gps"]
+    tasks.append(_safe_fetch_gps())
     gathered = await asyncio.gather(*tasks)
 
     data: dict[str, object] = {}
