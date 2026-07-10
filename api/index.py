@@ -188,11 +188,14 @@ async def get_widget_data(
         default=None,
         description="Filter by a specific vehicle VIN. Omit to use first vehicle.",
     ),
-) -> dict:
+) -> JSONResponse:
     """Fetch compact widget data for dashboard display.
 
     Returns battery %, range, tire pressures, lock status, charging status,
     climate status, online status, and last update timestamp.
+    
+    Returns explicit JSONResponse for compatibility with KWGT and other
+    strict HTTP clients.
     """
     config = _build_config()
 
@@ -294,20 +297,24 @@ async def get_widget_data(
         now = datetime.now()
         updated = now.strftime("%H:%M")
 
-        return {
-            "battery": battery,
-            "range": range_val,
-            "evRange": ev_range_val,
-            "locked": locked,
-            "charging": charging,
-            "climate": climate,
-            "online": online,
-            "lf": lf,
-            "rf": rf,
-            "lr": lr,
-            "rr": rr,
-            "updated": updated,
-        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "battery": battery,
+                "range": range_val,
+                "evRange": ev_range_val,
+                "locked": locked,
+                "charging": charging,
+                "climate": climate,
+                "online": online,
+                "lf": lf,
+                "rf": rf,
+                "lr": lr,
+                "rr": rr,
+                "updated": updated,
+            },
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
 
 
 # ---------------------------------------------------------------------------
