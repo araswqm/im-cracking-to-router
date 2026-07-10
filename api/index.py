@@ -85,6 +85,25 @@ def _serialize(value: object) -> object:
     return value
 
 
+def _serialize_gps(value: object) -> object | None:
+    """Serialize GPS data, returning ``None`` when coordinates are invalid.
+
+    Lat 0 / Lon 0 (Null Island) or None values indicate the vehicle has no
+    GPS fix (garage, underground parking, etc.) or the last known position
+    is unavailable.  Returning ``None`` lets consumers distinguish between
+    "no data" and an actual position at (0, 0).
+    """
+    raw = _serialize(value)
+    if not isinstance(raw, dict):
+        return None
+    lat = raw.get("latitude")
+    lon = raw.get("longitude")
+    # Both zero (Null Island) or both None → no valid fix
+    if (lat is None or lat == 0) and (lon is None or lon == 0):
+        return None
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -229,6 +248,8 @@ async def _fetch_vehicle_data(client: BydClient, vin: str) -> dict[str, object]:
                 "status": _serialize(value[0]),
                 "schedule": _serialize(value[1]),
             }
+        elif key == "gps":
+            data[key] = _serialize_gps(value)
         else:
             data[key] = _serialize(value)
 
