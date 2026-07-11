@@ -24,6 +24,7 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware  # <-- BUNU EKLEDIK
 from fastapi.responses import JSONResponse
 
 from pybyd import BydClient, BydConfig
@@ -42,6 +43,14 @@ app = FastAPI(
     title="BYD Vehicle Data API",
     description="Fetch all vehicle data from your BYD account via pyBYD.",
     version="1.0.0",
+)
+
+# <-- BUNU EKLEDIK (app = FastAPI'den hemen sonra)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
