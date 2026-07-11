@@ -24,7 +24,7 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware  # <-- BUNU EKLEDIK
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from pybyd import BydClient, BydConfig
@@ -45,7 +45,6 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# <-- BUNU EKLEDIK (app = FastAPI'den hemen sonra)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
