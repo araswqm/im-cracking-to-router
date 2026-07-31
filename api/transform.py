@@ -36,7 +36,12 @@ CHARGING_STATES = {
 }
 CONNECT_STATES = {-1: "unknown", 0: "disconnected", 1: "connected"}
 ONLINE_STATES = {-1: "unknown", 1: "online", 2: "offline"}
-VEHICLE_STATES = {-1: "unknown", 0: "off", 2: "on"}
+VEHICLE_STATES = {
+    -1: "unknown",
+    0: "off",
+    2: "unknown",  # pyBYD flags 2="on" as NOT CONFIRMED, and a physically
+    # off/parked car still reported 2 — report as unknown rather than "on".
+}
 GEAR_STATES = {-1: "unknown", 1: "off", 3: "on"}
 WINDOW_STATES = {-1: "unknown", 1: "closed", 2: "open"}
 SEAT_LEVELS = {-1: None, 0: None, 1: "off", 2: "low", 3: "high"}  # 0 = no data
