@@ -35,6 +35,11 @@ from pybyd.exceptions import (
     BydTransportError,
 )
 
+try:
+    from transform import transform_vehicle  # Vercel prod (api/ on sys.path)
+except ImportError:  # local/dev runs
+    from api.transform import transform_vehicle
+
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
@@ -139,6 +144,80 @@ async def get_vehicle_data(
     Authenticates with BYD using credentials from environment variables,
     then gathers realtime, GPS, HVAC, charging, energy, and configuration
     data for every vehicle (optionally filtered by VIN).
+
+    This is the *raw* endpoint — for the deduplicated, human-readable
+    view of the same data see ``/api/v2``.
+    """
+    vehicle_results = await _login_and_fetch_vehicles(vin)
+
+    if not vehicle_results:
+        return {
+            "success": True,
+            "vehicle_count": 0,
+            "vehicles": [],
+            "message": "No vehicles found on this BYD account.",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return {
+        "success": True,
+        "vehicle_count": len(vehicle_results),
+        "vehicles": vehicle_results,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/v2")
+@app.get("/api/v2/")
+async def get_vehicle_data_v2(
+    request: Request,
+    vin: str | None = Query(
+        default=None,
+        description="Filter by a specific vehicle VIN. Omit to return all vehicles.",
+    ),
+) -> dict:
+    """Fetch vehicle data as clean, deduplicated, human-readable JSON.
+
+    Uses the exact same BYD data source as ``/api`` but transforms each
+    vehicle with :func:`transform.transform_vehicle`:
+
+    * every nested ``raw`` BYD payload is removed,
+    * values BYD repeats across sections (odometer, SoC, timezone,
+      temperatures, seat states, ...) are collapsed to one canonical field,
+    * enum integers become ``{"code", "label"}`` objects and binary flags
+      become booleans.
+    """
+    vehicle_results = await _login_and_fetch_vehicles(vin)
+
+    if not vehicle_results:
+        return {
+            "success": True,
+            "vehicle_count": 0,
+            "vehicles": [],
+            "message": "No vehicles found on this BYD account.",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return {
+        "success": True,
+        "vehicle_count": len(vehicle_results),
+        "vehicles": [transform_vehicle(v) for v in vehicle_results],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared auth / fetch pipeline
+# ---------------------------------------------------------------------------
+
+
+async def _login_and_fetch_vehicles(vin: str | None) -> list[dict]:
+    """Authenticate, discover vehicles, optionally filter by VIN, and fetch
+    the raw v1 payload for every matching vehicle.
+
+    Shared by the ``/api`` and ``/api/v2`` endpoints.  Raises
+    ``HTTPException`` (401/502/504/404) on any failure; returns a list of
+    per-vehicle dicts (empty only when the account has no vehicles).
     """
     config = _build_config()
 
@@ -171,15 +250,6 @@ async def get_vehicle_data(
                 detail=f"Failed to fetch vehicle list. ({exc})",
             ) from exc
 
-        if not vehicles:
-            return {
-                "success": True,
-                "vehicle_count": 0,
-                "vehicles": [],
-                "message": "No vehicles found on this BYD account.",
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
-            }
-
         # Optional VIN filter
         if vin:
             vehicles = [v for v in vehicles if v.vin == vin]
@@ -189,7 +259,7 @@ async def get_vehicle_data(
                     detail=f"No vehicle found with VIN: {vin}",
                 )
 
-        # ── Gather all data for each vehicle (parallel per-vehicle) ──
+        # ── Gather all data for each vehicle ──────────────────────────
         vehicle_results: list[dict] = []
 
         for vehicle in vehicles:
@@ -198,12 +268,7 @@ async def get_vehicle_data(
             v_data["info"] = vehicle.model_dump(by_alias=True, mode="json")
             vehicle_results.append(v_data)
 
-        return {
-            "success": True,
-            "vehicle_count": len(vehicle_results),
-            "vehicles": vehicle_results,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
+        return vehicle_results
 
 
 # ---------------------------------------------------------------------------
