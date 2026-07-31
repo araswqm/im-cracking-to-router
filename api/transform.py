@@ -30,7 +30,9 @@ CHARGING_STATES = {
     -1: "unknown",
     0: "not_charging",
     1: "charging",
-    15: "connected",  # note: pyBYD warns 15 doesn't reliably follow the gun
+    15: "unknown",  # note: pyBYD warns 15 doesn't reliably follow the charging
+    # gun — verified against a car that was NOT plugged in yet reported 15;
+    # connectState → ``battery.plugged_in`` is the authoritative source.
 }
 CONNECT_STATES = {-1: "unknown", 0: "disconnected", 1: "connected"}
 ONLINE_STATES = {-1: "unknown", 1: "online", 2: "offline"}
@@ -38,7 +40,8 @@ VEHICLE_STATES = {-1: "unknown", 0: "off", 2: "on"}
 GEAR_STATES = {-1: "unknown", 1: "off", 3: "on"}
 WINDOW_STATES = {-1: "unknown", 1: "closed", 2: "open"}
 SEAT_LEVELS = {-1: None, 0: None, 1: "off", 2: "low", 3: "high"}  # 0 = no data
-STEERING_WHEEL_HEAT = {-1: "on", 1: "off"}  # NOTE: inverted scale in BYD
+STEERING_WHEEL_HEAT = {-1: "unknown", 1: "off"}  # -1 = standard unknown sentinel,
+# not "on" — verified against a parked car reporting -1 while nothing was heating
 TIRE_UNITS = {-1: "unknown", 1: "bar", 2: "psi", 3: "kpa"}
 AIR_CIRCULATION = {-1: "unknown", 0: "unavailable", 1: "external", 2: "internal"}
 HVAC_STATUS = {-1: "unknown", 1: "on", 2: "off"}
@@ -80,6 +83,29 @@ def _warn(value: int | None) -> dict | None:
     if value < 0:
         return {"status": "unknown", "code": value}
     return {"status": "warning" if value > 0 else "ok", "code": value}
+
+
+def _pwr(value: int | None) -> dict | None:
+    """Motor power indicator: 0=ok, 1=warning, anything else = unknown.
+
+    Some BYD hybrids persistently report ``pwr=2`` with no actual motor
+    fault (confirmed on a SEAL U DM-i), so only ``1`` is treated as a real
+    warning and other non-zero values are reported as unknown instead of
+    inventing a fault.
+    """
+    if value is None:
+        return None
+    if value < 0:
+        return {"status": "unknown", "code": value}
+    return {"status": "ok" if value == 0 else ("warning" if value == 1 else "unknown"), "code": value}
+
+
+def _temp(value, hvac_on: bool):
+    """Climate temperature value, or ``None`` for the 0.0 "not set"
+    sentinel BYD reports while the HVAC is off (avoids a misleading 0°C)."""
+    if not hvac_on and value in (0, 0.0):
+        return None
+    return value
 
 
 def _seat(value: int | None) -> str | None:
@@ -305,13 +331,14 @@ def transform_vehicle(raw: dict) -> dict:
     }
 
     # ── climate (hvac is canonical; realtime duplicates are dropped) ────
+    hvac_on = hvac.get("status") == 1
     climate = {
         "power": _enum(hvac.get("status"), HVAC_STATUS),
         "mode": _enum(hvac.get("airConditioningMode"), AC_MODES),
-        "driver_temp_c": hvac.get("mainSettingTempNew"),
-        "passenger_temp_c": hvac.get("copilotSettingTempNew"),
-        "inside_temp_c": hvac.get("tempInCar"),
-        "outside_temp_c": hvac.get("tempOutCar"),
+        "driver_temp_c": _temp(hvac.get("mainSettingTempNew"), hvac_on),
+        "passenger_temp_c": _temp(hvac.get("copilotSettingTempNew"), hvac_on),
+        "inside_temp_c": _temp(hvac.get("tempInCar"), hvac_on),
+        "outside_temp_c": _temp(hvac.get("tempOutCar"), hvac_on),
         "dual_zone_supported": _on_off(hvac.get("whetherSupportAdjustTemp")),
         "fan": {
             "mode": _enum(hvac.get("windMode"), WIND_MODES),
@@ -408,7 +435,7 @@ def transform_vehicle(raw: dict) -> dict:
             "service": _warn(rt.get("svs")),
             "airbag": _warn(rt.get("srs")),
             "coolant_temperature": _warn(rt.get("ect")),
-            "motor_power": _warn(rt.get("pwr")),
+            "motor_power": _pwr(rt.get("pwr")),
             "oil_pressure": _warn(rt.get("oilPressureSystem")),
             "braking": _warn(rt.get("brakingSystem")),
             "charging": _warn(rt.get("chargingSystem")),
