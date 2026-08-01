@@ -1,5 +1,5 @@
 """
-Clean, deduplicated vehicle transform for the ``/api/v2`` endpoint.
+Clean, deduplicated vehicle transform for the ``/monitor`` endpoint.
 
 Takes the raw per-vehicle payload produced by the v1 endpoint
 (``_fetch_vehicle_data`` in ``index.py``) and returns an organized,
