@@ -82,12 +82,21 @@ stream emits a handful of fake steps. Good for testing without the phone.
 
 ## Streaming on Vercel
 
+* The deployment uses the **modern Python runtime** (see `vercel.json` — no
+  legacy `builds` block). The legacy `@vercel/python` build path buffers the
+  whole stream and returns it only when the generator finishes, so the log
+  appears all at once instead of live.
 * `vercel.json` sets `maxDuration: 60` for the function (Hobby default is
   10 s).
 * The stream closes after `CONTROL_STREAM_TIMEOUT` (default 45 s) if the
   phone never reports completion — stay under the function limit.
 * Anti-buffering headers (`Cache-Control: no-cache, no-transform`,
   `X-Accel-Buffering: no`) are set on the control response.
+* The client must read the response **incrementally** to show lines as they
+  arrive. `await fetch(url).then(r => r.text())` hides everything until the
+  stream ends. Use `fetch` + `response.body.getReader()` instead — see
+  `public/control.html`, a ready-made live-log page served at `/control.html`
+  (pass `?key=...` when `CONTROL_API_KEY` is set).
 
 ## Shared state across instances
 
