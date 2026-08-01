@@ -13,10 +13,5 @@
     { "src": "/api(.*)", "dest": "api/index.py" },
     { "src": "/monitor(.*)", "dest": "api/index.py" },
     { "src": "/(.*)", "dest": "public/$1" }
-  ],
-  "functions": {
-    "api/index.py": {
-      "maxDuration": 60
-    }
-  }
+  ]
 }
