@@ -58,41 +58,65 @@
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  const POLL_MS = 500;   // how often we fetch new lines
+  const MAX_MS = 90_000; // safety cap so we never poll forever
+
   async function run(q) {
     logEl.textContent = '';
     const buttons = document.querySelectorAll('header button');
     buttons.forEach(b => (b.disabled = true));
     statusEl.textContent = 'connecting…';
 
-    const url = `/api/control?q=${encodeURIComponent(q)}`
-      + (apiKey ? `&key=${encodeURIComponent(apiKey)}` : '');
+    const key = apiKey ? `&key=${encodeURIComponent(apiKey)}` : '';
 
+    // 1. Start the action — this returns quickly with a session id.
+    let session, dryRun = false;
     try {
-      const resp = await fetch(url);
-      if (!resp.ok) {
-        const detail = await resp.text().catch(() => '');
-        append(`HTTP ${resp.status} ${detail}`.trim(), 'err');
+      const resp = await fetch(`/api/control?q=${encodeURIComponent(q)}${key}`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        append(`HTTP ${resp.status} ${data.detail || data.error || ''}`.trim(), 'err');
         statusEl.textContent = `failed (HTTP ${resp.status})`;
         return;
       }
-      // Read the stream chunk-by-chunk so lines appear the moment they arrive.
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let ended = false;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) { ended = true; break; }
-        buffer += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, nl).trimEnd();
-          buffer = buffer.slice(nl + 1);
-          if (line) append(line);
+      session = data.session;
+      dryRun = !!data.dry_run;
+      append(`[byd-control] action=${data.action} session=${session} connected`);
+      if (dryRun) append('[byd-control] dry-run mode — simulating phone output');
+    } catch (err) {
+      append(String(err), 'err');
+      statusEl.textContent = 'error';
+      return;
+    }
+
+    // 2. Poll for new lines every POLL_MS. No long-lived stream, so it works
+    //    even when the server buffers chunked responses (Vercel Python).
+    const started = Date.now();
+    let offset = 0;
+    let done = false;
+
+    try {
+      while (!done && Date.now() - started < MAX_MS) {
+        const r = await fetch(
+          `/api/control/poll?session=${encodeURIComponent(session)}&offset=${offset}${key}`
+        );
+        if (!r.ok) {
+          const detail = await r.text().catch(() => '');
+          append(`poll HTTP ${r.status} ${detail}`.trim(), 'err');
+          statusEl.textContent = `poll failed (HTTP ${r.status})`;
+          break;
         }
+        const data = await r.json();
+        for (const line of (data.lines || [])) {
+          // Don't surface the internal completion sentinel itself.
+          if (line && line.trim().toUpperCase() === '__DONE__') continue;
+          append(line);
+        }
+        offset = data.offset != null ? data.offset : offset;
+        done = !!data.done;
+        if (!done) await new Promise(res => setTimeout(res, POLL_MS));
       }
-      if (buffer.trim()) append(buffer.trimEnd());
-      statusEl.textContent = ended ? 'completed' : 'stream closed';
+      statusEl.textContent = done ? 'completed' : 'timed out';
     } catch (err) {
       append(String(err), 'err');
       statusEl.textContent = 'error';

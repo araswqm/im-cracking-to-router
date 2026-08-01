@@ -4,7 +4,7 @@ Vercel serverless API for a BYD account, backed by [pyBYD](https://github.com/jk
 
 * Monitor your vehicle: realtime, GPS, HVAC, charging, energy, config.
 * Control it through a MacroDroid webhook on an always-on phone, with the
-  phone's live progress streamed back to the client as plain text.
+  phone's live progress polled back to the client every 500ms.
 
 ## Endpoints
 
@@ -12,7 +12,8 @@ Vercel serverless API for a BYD account, backed by [pyBYD](https://github.com/jk
 |---|---|---|
 | `GET` | `/monitor` | Clean, deduplicated, human-readable vehicle data |
 | `GET` | `/monitor/raw` | Raw pyBYD payloads, untransformed |
-| `GET` | `/api/control?q=<action>` | Fire a vehicle action + stream live phone log |
+| `GET` | `/api/control?q=<action>` | Fire a vehicle action; returns a session id to poll |
+| `GET` | `/api/control/poll?session=<sid>&offset=<n>` | Read new log lines for a running action |
 | `POST` | `/api/log` | Phone log receiver (MacroDroid POSTs here) |
 | `GET` | `/api/health` | Health check (no BYD auth) |
 
@@ -20,8 +21,8 @@ Vercel serverless API for a BYD account, backed by [pyBYD](https://github.com/jk
 
 See [`.env.example`](.env.example). Required: `BYD_USERNAME`, `BYD_PASSWORD`.
 Optional: `BYD_BASE_URL`, `BYD_COUNTRY_CODE`, `MACRODROID_BASE_URL`,
-`CONTROL_API_KEY`, `CONTROL_STREAM_TIMEOUT`, `CONTROL_DRY_RUN`,
-`UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`.
+`CONTROL_API_KEY`, `CONTROL_DRY_RUN`, `UPSTASH_REDIS_REST_URL`,
+`UPSTASH_REDIS_REST_TOKEN`.
 
 ## Vehicle control flow
 
@@ -33,21 +34,24 @@ Client ──GET /api/control?q=lock──▶ Vercel API
                                        │              in the BYD app
                                        │  POST /api/log (each step)
                                        ▼
-                                   Vercel API ── streams lines to client
+                                   Vercel API ── stores lines in session
                                        ▼
-                                   Client sees live text/plain output
+                       Client polls /api/control/poll every 500ms
+                                       ▼
+                       Client sees live output, line by line
 ```
 
-1. `GET /api/control?q=<action>` validates the action and creates a session.
+1. `GET /api/control?q=<action>` validates the action, creates a session and
+   returns JSON `{ok, action, session, poll_url}` immediately.
 2. The API fires the MacroDroid webhook:
    `{MACRODROID_BASE_URL}?control=<action>&sid=<session>`.
 3. The phone's MacroDroid macro performs the action and POSTs each status
    update to `POST /api/log?session=<session>&line=<message>` (or as a
    form/JSON/raw-text body). When finished it sends
    `POST /api/log?...&done=1` — or posts a `__DONE__` line.
-4. The `/api/control` response streams each line back live as
-   `text/plain; charset=utf-8` (chunked, no HTML), one line per newline,
-   ending with `[byd-control] completed`.
+4. The client polls `GET /api/control/poll?session=<sid>&offset=<n>` every
+   ~500ms. Each response is `{lines, offset, done}`; pass the returned
+   `offset` back on the next poll. Stop when `done` is true.
 
 Supported `q` values: `unlock`, `lock`, `headlights`, `honk`, `trunk_open`,
 `trunk_close`, `windows_close`, `engine_off`.
@@ -80,23 +84,21 @@ If `CONTROL_API_KEY` is set, `/api/control` and `/api/log` require it via
 Set `CONTROL_DRY_RUN=1` to simulate the phone: no real MacroDroid call, the
 stream emits a handful of fake steps. Good for testing without the phone.
 
-## Streaming on Vercel
+## Live updates (polling)
 
 * The deployment uses the **modern Python runtime** (see `vercel.json` — no
-  legacy `builds` block). The legacy `@vercel/python` build path buffers the
-  whole stream and returns it only when the generator finishes, so the log
-  appears all at once instead of live.
-* `vercel.json` sets `maxDuration: 60` for the function (Hobby default is
-  10 s).
-* The stream closes after `CONTROL_STREAM_TIMEOUT` (default 45 s) if the
-  phone never reports completion — stay under the function limit.
-* Anti-buffering headers (`Cache-Control: no-cache, no-transform`,
-  `X-Accel-Buffering: no`) are set on the control response.
-* The client must read the response **incrementally** to show lines as they
-  arrive. `await fetch(url).then(r => r.text())` hides everything until the
-  stream ends. Use `fetch` + `response.body.getReader()` instead — see
-  `public/control.html`, a ready-made live-log page served at `/control.html`
-  (pass `?key=...` when `CONTROL_API_KEY` is set).
+  legacy `builds` block), but Vercel still buffers `StreamingResponse` bodies
+  until the generator ends, so a long-lived stream would arrive all at once
+  instead of live. The control flow therefore uses **polling**:
+  `/api/control` returns a session id immediately, and the client polls
+  `GET /api/control/poll?session=…&offset=…` every 500ms.
+* Each poll returns `{lines, offset, done}` — pass the returned `offset` back
+  on the next poll so lines are neither re-read nor skipped, and stop when
+  `done` is true (the client caps itself at ~90s).
+* The phone still POSTs to `/api/log` exactly as before; nothing on the
+  MacroDroid side changed.
+* See `public/control.html`, a ready-made live-log page served at
+  `/control.html` (pass `?key=...` when `CONTROL_API_KEY` is set).
 
 ## Shared state across instances
 

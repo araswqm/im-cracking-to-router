@@ -5,8 +5,10 @@ Endpoints:
 
     GET  /monitor          — clean, deduplicated, human-readable vehicle data
     GET  /monitor/raw      — raw pyBYD vehicle data, untransformed
-    GET  /api/control?q=…  — fire a vehicle action via MacroDroid and stream
-                              the phone's live log back as text/plain
+    GET  /api/control?q=…  — fire a vehicle action via MacroDroid; returns a
+                              session id to poll (no long-lived stream)
+    GET  /api/control/poll — read new log lines for a running action; the
+                              client polls this every ~500ms
     POST /api/log          — log receiver the phone (MacroDroid) POSTs to
     GET  /api/health       — lightweight health check (no BYD auth)
 
@@ -32,12 +34,11 @@ import asyncio
 import os
 import urllib.parse
 import uuid
-from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from pybyd import BydClient, BydConfig
 from pybyd.exceptions import (
@@ -79,15 +80,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Sentinel the phone sends (or a ``done`` flag) to end the control stream.
-_CONTROL_STREAM_TIMEOUT = float(os.environ.get("CONTROL_STREAM_TIMEOUT", "45"))
+# Dry-run mode simulates the phone (no real MacroDroid webhook call).
 _CONTROL_DRY_RUN = os.environ.get("CONTROL_DRY_RUN", "").strip().lower() in (
     "1",
     "true",
     "yes",
 )
 _CONTROL_API_KEY = os.environ.get("CONTROL_API_KEY", "").strip()
-_POLL_INTERVAL = 0.3  # seconds between log-queue polls while streaming
 
 
 # ---------------------------------------------------------------------------
@@ -260,13 +259,17 @@ async def control_vehicle(
             "trunk_open, trunk_close, windows_close, engine_off."
         ),
     ),
-) -> StreamingResponse:
-    """Fire a vehicle action via MacroDroid and stream the phone's live log.
+) -> dict:
+    """Fire a vehicle action via MacroDroid and return a session to poll.
 
     Flow: this endpoint triggers the matching MacroDroid webhook → the
     always-on phone performs the action in the BYD app while POSTing status
-    updates to ``/api/log`` → those lines are streamed back to the client
-    here as ``text/plain`` chunked output (one line per newline, no HTML).
+    updates to ``/api/log`` → the client polls ``/api/control/poll`` every
+    ~500ms to read those lines as they arrive.
+
+    Returns JSON immediately instead of a long-lived stream — Vercel's Python
+    runtime buffers ``StreamingResponse`` bodies until the generator ends, so
+    line-by-line live output is delivered by polling instead.
     """
     if not _authorized(request):
         raise HTTPException(status_code=401, detail="Invalid or missing control API key.")
@@ -288,7 +291,7 @@ async def control_vehicle(
     # Kick off the phone work — real webhook call or dry-run simulation.
     if _CONTROL_DRY_RUN:
         asyncio.create_task(simulate_phone(store, sid, action))
-        trigger = {"ok": True, "dry_run": True}
+        dry_run = True
     else:
         trigger = await trigger_macrodroid(action, sid=sid)
         if not trigger.get("ok"):
@@ -297,68 +300,46 @@ async def control_vehicle(
                 status_code=502,
                 detail=f"Failed to trigger MacroDroid. {trigger.get('error')}",
             )
+        dry_run = False
 
-    stream = _control_stream(store, sid, action, trigger)
-    return StreamingResponse(
-        stream,
-        media_type="text/plain; charset=utf-8",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "X-Control-Session": sid,
-        },
-    )
+    return {
+        "ok": True,
+        "action": action,
+        "session": sid,
+        "dry_run": dry_run,
+        "poll_url": f"/api/control/poll?session={sid}",
+    }
 
 
-async def _control_stream(
-    store, sid: str, action: str, trigger: dict
-) -> AsyncIterator[str]:
-    """Async generator backing the control stream.
+@app.get("/api/control/poll")
+async def control_poll(
+    request: Request,
+    session: str | None = Query(default=None),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """Return new log lines for ``session`` since ``offset``.
 
-    Polls the log queue until the phone reports ``done`` (or a timeout),
-    yielding each new line as it arrives so the client sees a live tail.
+    The client polls this every ~500ms while a control action runs.  Returns
+    the fresh lines, the next ``offset`` to pass back, and whether the phone
+    has reported completion (``done``).
     """
-    yield f"[byd-control] action={action} session={sid} connected\n"
-    if trigger.get("dry_run"):
-        yield "[byd-control] dry-run mode — simulating phone output\n"
-    else:
-        yield f"[byd-control] macro triggered (HTTP {trigger.get('status_code')})\n"
+    if not _authorized(request):
+        raise HTTPException(status_code=401, detail="Invalid or missing control API key.")
+    if not session:
+        raise HTTPException(
+            status_code=400, detail="Missing required query param 'session'."
+        )
 
-    offset = 0
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + _CONTROL_STREAM_TIMEOUT
-
+    store = get_log_store()
     try:
-        while True:
-            if loop.time() >= deadline:
-                yield "[byd-control] timed out waiting for phone — no new log lines\n"
-                break
+        lines, offset, done = await store.fetch(session, offset)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active control session {session!r}. Start one via /api/control.",
+        )
 
-            try:
-                lines, offset, done = await store.fetch(sid, offset)
-            except KeyError:
-                yield "[byd-control] session expired or was dropped\n"
-                break
-            except Exception as exc:  # Redis hiccup etc. — keep streaming
-                yield f"[byd-control] error: {exc}\n"
-                done = False
-
-            for line in lines:
-                yield f"{line}\n"
-                if is_done_marker(line):
-                    done = True
-
-            if done:
-                yield "[byd-control] completed\n"
-                break
-
-            await asyncio.sleep(_POLL_INTERVAL)
-    finally:
-        # Best-effort cleanup so a stray session doesn't linger for TTL.
-        try:
-            await store.drop(sid)
-        except Exception:
-            pass
+    return {"ok": True, "lines": lines, "offset": offset, "done": done}
 
 
 @app.post("/api/log")
