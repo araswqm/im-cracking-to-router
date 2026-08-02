@@ -185,65 +185,26 @@ _CONTROL_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BYD Control — Live Log</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-         background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
-  header { padding: 10px 16px; border-bottom: 1px solid #30363d; display: flex; gap: 16px;
-           flex-wrap: wrap; align-items: baseline; }
-  #title { font-weight: 600; }
-  #title .act { color: #58a6ff; }
-  #sub { color: #8b949e; font-size: 13px; }
-  #status { margin-left: auto; font-size: 13px; color: #8b949e; }
-  #log { flex: 1; overflow-y: auto; padding: 12px 16px; white-space: pre-wrap;
-         word-break: break-word; font-size: 13px; line-height: 1.6; }
-  #log .ts { color: #58a6ff; }
-  #log .err { color: #f85149; }
-  #log .done { color: #3fb950; }
-  .note { color: #d29922; }
-  a { color: #58a6ff; }
-</style>
+<title>Control — __ACTION__</title>
 </head>
 <body>
-<header>
-  <div id="title">Action: <span class="act" id="action"></span></div>
-  <div id="sub">session: <span id="session"></span></div>
-  <div id="status">connecting…</div>
-</header>
-<pre id="log"></pre>
+<pre id="log">action=__ACTION__ session=__SESSION__
+</pre>
 <script>
   const SESSION = "__SESSION__";
-  const ACTION = "__ACTION__";
   const KEY_QS = "__KEY_QS__";
-  const DRY = __DRY__;
-
   const logEl = document.getElementById('log');
-  const statusEl = document.getElementById('status');
-  document.getElementById('action').textContent = ACTION;
-  document.getElementById('session').textContent = SESSION;
-
-  const stamp = () => new Date().toLocaleTimeString();
-  function append(text, cls) {
-    const div = document.createElement('div');
-    const t = document.createElement('span');
-    t.className = 'ts';
-    t.textContent = `[${stamp()}] `;
-    div.appendChild(t);
-    const body = document.createElement('span');
-    body.textContent = text;
-    if (cls) body.className = cls;
-    div.appendChild(body);
-    logEl.appendChild(div);
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-
-  append(`[byd-control] action=${ACTION} session=${SESSION} connected`);
-  if (DRY) append('[byd-control] dry-run mode — simulating phone output', 'done');
 
   const POLL_MS = 500;   // how often we fetch new lines
   const MAX_MS = 90_000; // safety cap so we never poll forever
+
+  const stamp = () => new Date().toLocaleTimeString();
+  function append(text) {
+    logEl.textContent += `[${stamp()}] ${text}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  if (__DRY__) append('dry-run mode — simulating phone output');
 
   (async () => {
     const started = Date.now();
@@ -255,25 +216,22 @@ _CONTROL_PAGE = """<!doctype html>
           `/api/control/poll?session=${encodeURIComponent(SESSION)}&offset=${offset}${KEY_QS}`
         );
         if (!r.ok) {
-          const detail = await r.text().catch(() => '');
-          append(`poll HTTP ${r.status} ${detail}`.trim(), 'err');
-          statusEl.textContent = `poll failed (HTTP ${r.status})`;
+          append(`poll HTTP ${r.status} ${await r.text().catch(() => '')}`.trim());
           break;
         }
         const data = await r.json();
         for (const line of (data.lines || [])) {
-          // Don't surface the internal completion sentinel itself.
-          if (line && line.trim().toUpperCase() === '__DONE__') continue;
+          // __DONE__ ends the operation — don't surface the sentinel itself.
+          if (line && line.trim().toUpperCase() === '__DONE__') { done = true; continue; }
           append(line);
         }
         offset = data.offset != null ? data.offset : offset;
-        done = !!data.done;
+        if (data.done) done = true;
         if (!done) await new Promise(res => setTimeout(res, POLL_MS));
       }
-      statusEl.textContent = done ? 'completed' : 'timed out';
+      append(done ? 'completed' : 'timed out');
     } catch (err) {
-      append(String(err), 'err');
-      statusEl.textContent = 'error';
+      append(String(err));
     }
   })();
 </script>
@@ -283,13 +241,14 @@ _CONTROL_PAGE = """<!doctype html>
 
 
 def _render_control_page(session: str, action: str, dry_run: bool, api_key: str) -> str:
-    """Self-contained HTML page showing a control action's live log lines.
+    """Self-contained, unstyled HTML page showing a control action's log.
 
     Served instead of JSON when a *browser* navigates straight to
     ``/api/control?q=...`` (the request ``Accept`` header asks for
     ``text/html``).  API clients and the ``control.html`` JavaScript fetch
     with ``Accept: */*`` and keep getting JSON.  The page polls
-    ``/api/control/poll`` every 500ms and renders each line as it arrives —
+    ``/api/control/poll`` every 500ms and appends each line as plain text,
+    stopping when the phone reports done or a ``__DONE__`` line arrives —
     the same behaviour as ``public/control.html``, but self-starting.
     """
     key_qs = f"&key={api_key}" if api_key else ""
