@@ -1,13 +1,15 @@
-"""Tests for /api/control (streaming) and POST /api/log (phone receiver).
+"""Tests for /api/control (session + poll) and POST /api/log (phone receiver).
+
+Control now returns a session id immediately and the client polls
+``/api/control/poll`` for log lines, so a phone POSTing into an active session
+is a plain request/response flow — testable through the TestClient.  The
+"real flow" tests still spin up a real uvicorn server (see ``_LiveServer``)
+to exercise true cross-request HTTP with a shared queue, which is exactly the
+scenario the Redis backend exists for.
 
 Dry-run mode is on (see conftest), so the real MacroDroid webhook is never
 called.  Tests that need the real-webhook path monkeypatch
 ``index.trigger_macrodroid`` and flip ``index._CONTROL_DRY_RUN`` instead.
-
-The TestClient transport runs the *whole* ASGI app — including a streaming
-body — to completion before returning, so a phone that POSTs into a still-open
-stream cannot be tested through it.  Those tests spin up a real uvicorn server
-in a background thread (see ``_LiveServer``).
 """
 
 from __future__ import annotations
@@ -37,6 +39,29 @@ def _create_session(sid: str) -> None:
 
 def _fetch_lines(sid: str, offset: int = 0) -> tuple[list[str], bool]:
     lines, _, done = asyncio.run(get_log_store().fetch(sid, offset))
+    return lines, done
+
+
+def _poll_to_done(get, sid: str, max_polls: int = 40, interval: float = 0.1):
+    """Poll /api/control/poll via ``get(url)`` until the session is done,
+    collecting the lines that arrive meanwhile.
+
+    ``get`` is any callable returning a response with ``.status_code`` and
+    ``.json()`` — works for both TestClient and a live httpx client.
+    """
+    lines: list[str] = []
+    offset = 0
+    done = False
+    for _ in range(max_polls):
+        r = get(f"/api/control/poll?session={sid}&offset={offset}")
+        assert r.status_code == 200, r.text
+        data = r.json()
+        lines.extend(data["lines"])
+        offset = data["offset"]
+        done = data["done"]
+        if done:
+            break
+        time.sleep(interval)
     return lines, done
 
 
@@ -102,22 +127,25 @@ def test_trigger_url_appends_control_and_sid():
 
 
 # ---------------------------------------------------------------------------
-# /api/control — dry-run streaming
+# /api/control — dry-run polling
 # ---------------------------------------------------------------------------
 
-def test_dry_run_streams_to_completion(client):
-    with client.stream("GET", "/api/control?q=unlock") as r:
-        assert r.status_code == 200
-        assert r.headers["content-type"].startswith("text/plain")
-        assert "x-control-session" in r.headers
-        assert r.headers["cache-control"] == "no-cache, no-transform"
-        text = "".join(r.iter_text())
+def test_dry_run_runs_to_completion_via_poll(client):
+    """Control returns a session immediately; the dry-run phone simulation
+    writes log lines in the background that polling then delivers."""
+    r = client.get("/api/control?q=unlock")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["action"] == "unlock"
+    assert data["dry_run"] is True
+    assert "session" in data
+    assert data["poll_url"].startswith("/api/control/poll?session=")
 
-    assert "[byd-control] action=unlock" in text
-    assert "connected" in text
-    assert "dry-run" in text
-    assert "[unlock] sim: received control command" in text
-    assert "[byd-control] completed" in text
+    lines, done = _poll_to_done(client.get, data["session"])
+    assert done is True
+    assert "[unlock] sim: received control command" in lines
+    assert "[unlock] sim: done" in lines
 
 
 def test_control_unknown_action_400(client):
@@ -170,7 +198,6 @@ def test_log_requires_key_when_configured(client, monkeypatch):
 def _real_trigger(monkeypatch):
     """Turn off dry-run and stub the MacroDroid webhook with a fast no-op."""
     monkeypatch.setattr(index, "_CONTROL_DRY_RUN", False)
-    monkeypatch.setattr(index, "_POLL_INTERVAL", 0.05)
 
     async def fake_trigger(action, sid=None, timeout=8.0):
         return {"ok": True, "status_code": 200}
@@ -178,53 +205,57 @@ def _real_trigger(monkeypatch):
     monkeypatch.setattr(index, "trigger_macrodroid", fake_trigger)
 
 
-def test_phone_posts_stream_to_client(_real_trigger):
+def test_phone_posts_log_to_polling_client(_real_trigger):
+    """The phone POSTs live status lines to /api/log while the client polls
+    /api/control/poll — lines flow through the shared queue to the poller."""
     with _LiveServer() as server:
         with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0)) as c:
-            with c.stream("GET", f"{server.base}/api/control?q=honk") as r:
-                assert r.status_code == 200
-                sid = r.headers["x-control-session"]
+            r = c.get(f"{server.base}/api/control?q=honk")
+            assert r.status_code == 200
+            sid = r.json()["session"]
 
-                step1 = c.post(
-                    f"{server.base}/api/log",
-                    params={"session": sid, "line": "step 1: opening BYD app"},
-                )
-                assert step1.status_code == 200
-                assert step1.json()["ok"] is True
+            step1 = c.post(
+                f"{server.base}/api/log",
+                params={"session": sid, "line": "step 1: opening BYD app"},
+            )
+            assert step1.status_code == 200
+            assert step1.json()["ok"] is True
 
-                step2 = c.post(
-                    f"{server.base}/api/log",
-                    params={"session": sid, "line": "step 2: pressing honk"},
-                )
-                assert step2.status_code == 200
+            step2 = c.post(
+                f"{server.base}/api/log",
+                params={"session": sid, "line": "step 2: pressing honk"},
+            )
+            assert step2.status_code == 200
 
-                done = c.post(f"{server.base}/api/log", params={"session": sid, "done": "1"})
-                assert done.status_code == 200
-                assert done.json()["done"] is True
+            done = c.post(f"{server.base}/api/log", params={"session": sid, "done": "1"})
+            assert done.status_code == 200
+            assert done.json()["done"] is True
 
-                text = "".join(r.iter_text())
+            lines, is_done = _poll_to_done(
+                lambda url: c.get(f"{server.base}{url}"), sid
+            )
 
-    assert "[byd-control] action=honk" in text
-    assert "macro triggered (HTTP 200)" in text
-    assert "step 1: opening BYD app" in text
-    assert "step 2: pressing honk" in text
-    assert "[byd-control] completed" in text
+    assert "step 1: opening BYD app" in lines
+    assert "step 2: pressing honk" in lines
+    assert is_done is True
 
 
-def test_log_done_marker_line_completes_stream(_real_trigger):
+def test_log_done_marker_line_completes_poll(_real_trigger):
     with _LiveServer() as server:
         with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0)) as c:
-            with c.stream("GET", f"{server.base}/api/control?q=lock") as r:
-                sid = r.headers["x-control-session"]
-                resp = c.post(
-                    f"{server.base}/api/log",
-                    params={"session": sid, "line": "__DONE__"},
-                )
-                assert resp.json()["done"] is True
-                text = "".join(r.iter_text())
+            r = c.get(f"{server.base}/api/control?q=lock")
+            sid = r.json()["session"]
+            resp = c.post(
+                f"{server.base}/api/log",
+                params={"session": sid, "line": "__DONE__"},
+            )
+            assert resp.json()["done"] is True
+            lines, is_done = _poll_to_done(
+                lambda url: c.get(f"{server.base}{url}"), sid
+            )
 
-    assert "__DONE__" in text
-    assert "[byd-control] completed" in text
+    assert "__DONE__" in lines
+    assert is_done is True
 
 
 def test_control_macro_failure_502(client, monkeypatch):

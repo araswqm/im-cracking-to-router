@@ -13,10 +13,14 @@ import pytest
 from api.logqueue import (
     KEY_PREFIX,
     InMemoryLogStore,
+    RedisClientStore,
     RedisLogStore,
+    get_log_store,
     is_done_marker,
     is_done_param,
+    uses_shared_store,
 )
+import api.logqueue as logqueue
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +128,130 @@ def test_inmemory_new_session_becomes_current():
         assert lines == ["for one"]
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# RedisClientStore — connection-string backend (fake redis.asyncio client)
+# ---------------------------------------------------------------------------
+
+class FakeRedis:
+    """In-memory stand-in for the ``redis.asyncio`` client RedisClientStore
+    talks to.  Implements just the commands the store issues."""
+
+    def __init__(self) -> None:
+        self.data: dict[str, object] = {}
+        self.ttls: dict[str, int] = {}
+
+    async def lpush(self, key: str, *values: str) -> int:
+        bucket = self.data.setdefault(key, [])
+        for v in reversed(values):
+            bucket.insert(0, v)
+        return len(bucket)
+
+    async def llen(self, key: str) -> int:
+        return len(self.data.get(key, []))
+
+    async def lrange(self, key: str, start: int, end: int) -> list[str]:
+        bucket = self.data.get(key, [])
+        return bucket[start : None if end == -1 else end + 1]
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> bool:
+        self.data[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+        return True
+
+    async def expire(self, key: str, ttl: int) -> int:
+        if key in self.data:
+            self.ttls[key] = ttl
+            return 1
+        return 0
+
+    async def get(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    async def delete(self, *keys: str) -> int:
+        removed = 0
+        for k in keys:
+            if k in self.data:
+                del self.data[k]
+                removed += 1
+        return removed
+
+
+def _client_store() -> tuple[RedisClientStore, FakeRedis]:
+    store = RedisClientStore("rediss://example.upstash.io")
+    fake = FakeRedis()
+    store._client = fake  # type: ignore[assignment]
+    return store, fake
+
+
+def test_redisclient_full_flow():
+    async def scenario():
+        store, fake = _client_store()
+
+        await store.create_session("abc")
+        assert await store.current() == "abc"
+        # create_session: seed list + current pointer with EX TTL
+        assert fake.ttls[store._key("abc")] == logqueue.KEY_TTL
+        assert fake.ttls[store._key("", "current")] == logqueue.KEY_TTL
+
+        assert await store.append(None, "first") is True  # routes to current
+        assert await store.append("abc", "second") is True
+
+        lines, offset, done = await store.fetch("abc", 0)
+        assert lines == ["first", "second"]
+        assert offset == 2
+        assert done is False
+
+        # Offset-based fetch returns only new lines.
+        lines, offset, done = await store.fetch("abc", 2)
+        assert lines == []
+        assert offset == 2
+
+        await store.append("abc", "third")
+        lines, offset, _ = await store.fetch("abc", 2)
+        assert lines == ["third"]
+        assert offset == 3
+        # append refreshes the session TTL
+        assert fake.ttls[store._key("abc")] == logqueue.KEY_TTL
+
+    asyncio.run(scenario())
+
+
+def test_redisclient_done_flag_complete_and_drop():
+    async def scenario():
+        store, _ = _client_store()
+        await store.create_session("abc")
+
+        assert (await store.fetch("abc", 0))[2] is False
+        await store.complete("abc")
+        assert (await store.fetch("abc", 0))[2] is True
+
+        await store.drop("abc")
+        with pytest.raises(KeyError):
+            await store.fetch("abc", 0)
+
+    asyncio.run(scenario())
+
+
+def test_redisclient_unknown_session():
+    async def scenario():
+        store, _ = _client_store()
+        # No session yet → append has no current target and unknown sids fail.
+        assert await store.append(None, "x") is False
+        assert await store.append("nope", "x") is False
+        with pytest.raises(KeyError):
+            await store.fetch("nope", 0)
+
+    asyncio.run(scenario())
+
+
+def test_redisclient_client_is_lazy():
+    """Constructing the store must not touch the network — only first use
+    creates the client (substituted with a fake here)."""
+    store = RedisClientStore("rediss://example.upstash.io")
+    assert store._client is None  # no connection yet
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +366,94 @@ def test_redis_decode_percent_encoding():
     assert store._decode("Checking%20locks%E2%80%A6") == "Checking locks…"
     assert store._decode("plain text") == "plain text"
     assert store._decode(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# Backend selection — get_log_store() / uses_shared_store()
+# ---------------------------------------------------------------------------
+
+_NO_REDIS_VARS = (
+    "UPSTASH_REDIS_REST_URL",
+    "UPSTASH_REDIS_REST_TOKEN",
+    "KV_REST_API_URL",
+    "KV_REST_API_TOKEN",
+    "REDIS_URL",
+    "REDIS_TOKEN",
+)
+
+
+@pytest.mark.parametrize(
+    "url_var,token_var",
+    [
+        ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
+        ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
+        ("REDIS_URL", "REDIS_TOKEN"),
+    ],
+)
+def test_get_log_store_picks_redis_for_any_env_pair(monkeypatch, url_var, token_var):
+    for var in _NO_REDIS_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(url_var, "https://example.upstash.io")
+    monkeypatch.setenv(token_var, "tok")
+    logqueue._store = None
+
+    assert isinstance(get_log_store(), RedisLogStore)
+    assert uses_shared_store() is True
+
+
+def test_get_log_store_falls_back_to_memory_when_no_redis_env(monkeypatch):
+    for var in _NO_REDIS_VARS:
+        monkeypatch.delenv(var, raising=False)
+    logqueue._store = None
+
+    assert isinstance(get_log_store(), InMemoryLogStore)
+    assert uses_shared_store() is False
+
+
+@pytest.mark.parametrize("url", ["redis://localhost:6379", "rediss://example.upstash.io"])
+def test_get_log_store_connection_string_uses_client_store(monkeypatch, url):
+    """Vercel Redis sets REDIS_URL alone (no token) — that must select the
+    redis-py connection-string store."""
+    for var in _NO_REDIS_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("REDIS_URL", url)
+    logqueue._store = None
+
+    assert isinstance(get_log_store(), RedisClientStore)
+    assert uses_shared_store() is True
+
+
+def test_get_log_store_ignores_unresolved_placeholder_url(monkeypatch):
+    """Vercel stores env references as [REDIS_URL] placeholders until runtime;
+    locally (and if the reference ever fails to resolve) that must NOT be
+    treated as a usable connection string."""
+    for var in _NO_REDIS_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("REDIS_URL", "[REDIS_URL]")
+    logqueue._store = None
+
+    assert isinstance(get_log_store(), InMemoryLogStore)
+    assert uses_shared_store() is False
+
+
+def test_get_log_store_connection_string_wins_over_rest_pair(monkeypatch):
+    for var in _NO_REDIS_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_URL", "https://x.upstash.io")
+    monkeypatch.setenv("UPSTASH_REDIS_REST_TOKEN", "tok")
+    logqueue._store = None
+
+    assert isinstance(get_log_store(), RedisClientStore)
+
+
+def test_get_log_store_redis_requires_both_url_and_token(monkeypatch):
+    for var in _NO_REDIS_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("KV_REST_API_URL", "https://example.upstash.io")
+    logqueue._store = None
+
+    assert isinstance(get_log_store(), InMemoryLogStore)
 
 
 # ---------------------------------------------------------------------------

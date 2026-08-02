@@ -10,3 +10,7 @@ uvicorn>=0.24,<1
 
 # Optional: better HTTP handling on Vercel
 httpx>=0.25,<1
+
+# Shared log queue backend (Vercel Redis / Upstash / any redis:// URL).
+# Activated automatically when REDIS_URL (or a *_REST_URL + *_TOKEN pair) is set.
+redis>=6,<9

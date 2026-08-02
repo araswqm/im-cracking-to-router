@@ -24,8 +24,13 @@ Environment Variables:
                                        open waiting for the phone (default 45)
     CONTROL_DRY_RUN (optional)       — "1"/"true": simulate the phone instead
                                        of calling the real MacroDroid webhook
-    UPSTASH_REDIS_REST_URL (optional)— enables the shared Redis log queue
-    UPSTASH_REDIS_REST_TOKEN (optional)
+    REDIS_URL (optional)             — Redis connection string (redis:// or
+                                       rediss://) for the shared log queue; set
+                                       automatically by Vercel's Redis
+                                       integration.  No token needed.
+    UPSTASH_REDIS_REST_URL (optional)— enables the shared Redis log queue via
+    UPSTASH_REDIS_REST_TOKEN (optional) Upstash's REST API (alternative to
+                                       REDIS_URL)
 """
 
 from __future__ import annotations
@@ -55,10 +60,10 @@ except ImportError:  # local/dev runs
 
 try:
     from control import CONTROL_MAP, resolve_action, simulate_phone, trigger_macrodroid
-    from logqueue import get_log_store, is_done_marker, is_done_param
+    from logqueue import get_log_store, is_done_marker, is_done_param, uses_shared_store
 except ImportError:  # local/dev runs
     from api.control import CONTROL_MAP, resolve_action, simulate_phone, trigger_macrodroid
-    from api.logqueue import get_log_store, is_done_marker, is_done_param
+    from api.logqueue import get_log_store, is_done_marker, is_done_param, uses_shared_store
 
 # ---------------------------------------------------------------------------
 # FastAPI application
@@ -307,6 +312,9 @@ async def health() -> dict:
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Which log-queue backend this instance would use.  Handy for
+        # verifying the shared Redis store is active in production.
+        "log_store": "redis" if uses_shared_store() else "memory",
     }
 
 
@@ -471,10 +479,18 @@ async def control_poll(
     try:
         lines, offset, done = await store.fetch(session, offset)
     except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active control session {session!r}. Start one via /api/control.",
-        )
+        detail = f"No active control session {session!r}. Start one via /api/control."
+        if not uses_shared_store():
+            # The in-memory store keeps a session only on the one Vercel
+            # instance that created it — a poll routed to another instance
+            # sees nothing.  Tell the user why instead of a dead-end 404.
+            detail += (
+                " The log queue is in-memory: Vercel routed this request to a "
+                "different serverless instance than the one that created the "
+                "session. Configure REDIS_URL (Vercel Redis connection string) "
+                "or an Upstash REST pair to share sessions."
+            )
+        raise HTTPException(status_code=404, detail=detail)
 
     return {"ok": True, "lines": lines, "offset": offset, "done": done}
 

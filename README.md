@@ -21,8 +21,8 @@ Vercel serverless API for a BYD account, backed by [pyBYD](https://github.com/jk
 
 See [`.env.example`](.env.example). Required: `BYD_USERNAME`, `BYD_PASSWORD`.
 Optional: `BYD_BASE_URL`, `BYD_COUNTRY_CODE`, `MACRODROID_BASE_URL`,
-`CONTROL_API_KEY`, `CONTROL_DRY_RUN`, `UPSTASH_REDIS_REST_URL`,
-`UPSTASH_REDIS_REST_TOKEN`.
+`CONTROL_API_KEY`, `CONTROL_DRY_RUN`, `REDIS_URL` (Vercel Redis connection
+string), `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`.
 
 ## Vehicle control flow
 
@@ -104,9 +104,24 @@ stream emits a handful of fake steps. Good for testing without the phone.
 
 Vercel serverless is stateless. Without extra configuration the log queue is
 in-process (`api/logqueue.py`), which works when requests keep hitting the
-same warm instance. For reliability across instances, set
-`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` and the same code
-switches to an Upstash Redis-backed queue (no new dependencies).
+same warm instance — but a poll that lands on a *different* instance gets
+`404 "No active control session"` and the live log stops.
+
+For reliability across instances, connect a Redis-backed store and the same
+code switches to a shared queue. The store is chosen automatically:
+
+1. **Vercel Redis** (easiest on Vercel) — add the "Redis" integration and it
+   sets `REDIS_URL` to a `rediss://` connection string automatically, with no
+   token needed. The code uses the official `redis` client for it.
+2. Any other connection string — set `REDIS_URL` yourself, e.g.
+   `REDIS_URL=rediss://user:pass@host:port`.
+3. REST pairs (alternative for accounts without a connection string):
+   `UPSTASH_REDIS_REST_URL`+`UPSTASH_REDIS_REST_TOKEN`, Vercel KV's
+   `KV_REST_API_URL`+`KV_REST_API_TOKEN`, or `REDIS_URL`(https)+`REDIS_TOKEN`.
+
+Add the vars in **Production** (and Preview) so the phone and the browser
+always read the same queue. `/api/health` reports which backend this instance
+is using (`"log_store": "redis"` vs `"memory"`).
 
 ## Local development
 
